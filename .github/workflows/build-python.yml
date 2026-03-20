@@ -1,0 +1,175 @@
+name: 构建-python
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "私有源码仓库，格式 owner/repo"
+        required: true
+        type: string
+      source_sha:
+        description: "私有源码仓库中的提交 SHA"
+        required: true
+        type: string
+      project_path:
+        description: "项目路径，例如 projects/python/sample-python-pkg"
+        required: true
+        type: string
+      project_name:
+        description: "项目名，例如 sample-python-pkg"
+        required: true
+        type: string
+      release_tag:
+        description: "私有仓库中的 Release 标签"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: 检出私有源码仓库
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.PRIVATE_SOURCE_READ_TOKEN }}
+          sparse-checkout: |
+            ${{ inputs.project_path }}
+            scripts/release/Upload-ToPrivateRelease.ps1
+            scripts/common/Invoke-WithRetry.ps1
+
+      - name: 加载项目构建配置
+        id: cfg
+        shell: pwsh
+        run: |
+          $projectRoot = Join-Path "${{ github.workspace }}" "${{ inputs.project_path }}"
+          $configPath = Join-Path $projectRoot "build.public.json"
+
+          $mode = "onefile"
+          $outputFile = "${{ inputs.project_name }}.exe"
+          $assetName = "${{ inputs.project_name }}-windows-x64.exe"
+          $nuitkaVersion = "main"
+          $windowsIconFromIco = ""
+          $includeDataFiles = ""
+          $assumeYesForDownloads = "true"
+
+          if (Test-Path -Path $configPath) {
+            $raw = Get-Content -Path $configPath -Raw
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+              $config = $raw | ConvertFrom-Json
+              if ($config.PSObject.Properties["python"] -and $config.python) {
+                if ($config.python.PSObject.Properties["mode"] -and -not [string]::IsNullOrWhiteSpace($config.python.mode)) {
+                  $mode = [string]$config.python.mode
+                }
+                if ($config.python.PSObject.Properties["output_filename"] -and -not [string]::IsNullOrWhiteSpace($config.python.output_filename)) {
+                  $outputFile = [string]$config.python.output_filename
+                }
+                if ($config.python.PSObject.Properties["asset_name"] -and -not [string]::IsNullOrWhiteSpace($config.python.asset_name)) {
+                  $assetName = [string]$config.python.asset_name
+                }
+                if ($config.python.PSObject.Properties["nuitka_version"] -and -not [string]::IsNullOrWhiteSpace($config.python.nuitka_version)) {
+                  $nuitkaVersion = [string]$config.python.nuitka_version
+                }
+                if ($config.python.PSObject.Properties["windows_icon_from_ico"] -and -not [string]::IsNullOrWhiteSpace($config.python.windows_icon_from_ico)) {
+                  $windowsIconFromIco = [string]$config.python.windows_icon_from_ico
+                }
+                if ($config.python.PSObject.Properties["include_data_files"] -and $config.python.include_data_files) {
+                  $includeDataFiles = (@($config.python.include_data_files) -join "`n")
+                }
+                if ($config.python.PSObject.Properties["assume_yes_for_downloads"]) {
+                  $assumeYesForDownloads = ([bool]$config.python.assume_yes_for_downloads).ToString().ToLowerInvariant()
+                }
+              }
+            }
+          }
+
+          "mode=$mode" >> $env:GITHUB_OUTPUT
+          "output_file=$outputFile" >> $env:GITHUB_OUTPUT
+          "asset_name=$assetName" >> $env:GITHUB_OUTPUT
+          "nuitka_version=$nuitkaVersion" >> $env:GITHUB_OUTPUT
+          "windows_icon_from_ico=$windowsIconFromIco" >> $env:GITHUB_OUTPUT
+          "assume_yes_for_downloads=$assumeYesForDownloads" >> $env:GITHUB_OUTPUT
+          "include_data_files<<EOF" >> $env:GITHUB_OUTPUT
+          $includeDataFiles >> $env:GITHUB_OUTPUT
+          "EOF" >> $env:GITHUB_OUTPUT
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装项目依赖
+        shell: pwsh
+        run: |
+          $projectRoot = Join-Path "${{ github.workspace }}" "${{ inputs.project_path }}"
+          Push-Location $projectRoot
+
+          if (Test-Path -Path "requirements.txt") {
+            python -m pip install -r requirements.txt
+          }
+
+          if (Test-Path -Path "pyproject.toml") {
+            python -m pip install .
+          }
+
+          Pop-Location
+
+      - name: 使用 Nuitka Action 构建单文件可执行程序
+        uses: Nuitka/Nuitka-Action@v1.4
+        with:
+          nuitka-version: ${{ steps.cfg.outputs.nuitka_version }}
+          working-directory: ${{ inputs.project_path }}
+          script-name: main.py
+          mode: ${{ steps.cfg.outputs.mode }}
+          output-file: ${{ steps.cfg.outputs.output_file }}
+          windows-icon-from-ico: ${{ steps.cfg.outputs.windows_icon_from_ico }}
+          include-data-files: ${{ steps.cfg.outputs.include_data_files }}
+          assume-yes-for-downloads: ${{ steps.cfg.outputs.assume_yes_for_downloads }}
+
+      - name: 定位 Nuitka 产物
+        id: nuitka_build
+        shell: pwsh
+        run: |
+          $buildDir = Join-Path "${{ github.workspace }}" "${{ inputs.project_path }}/build"
+          if (-not (Test-Path -Path $buildDir)) {
+            throw "Nuitka build directory not found: $buildDir"
+          }
+
+          $preferred = Join-Path $buildDir "${{ steps.cfg.outputs.output_file }}"
+          if (Test-Path -Path $preferred) {
+            $exe = Get-Item -Path $preferred
+          } else {
+            $exe = Get-ChildItem -Path $buildDir -Filter *.exe -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          }
+
+          if (-not $exe) {
+            throw "No exe artifact found in: $buildDir"
+          }
+
+          "asset_path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: 上传 Nuitka 产物到私有 Release
+        shell: pwsh
+        env:
+          PRIVATE_RELEASE_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
+        run: |
+          if (-not $env:PRIVATE_RELEASE_TOKEN) {
+            throw "Missing secret: PRIVATE_RELEASE_TOKEN"
+          }
+
+          $repoParts = "${{ inputs.source_repo }}".Split("/")
+          if ($repoParts.Count -ne 2) {
+            throw "source_repo must be owner/repo"
+          }
+
+          ./scripts/release/Upload-ToPrivateRelease.ps1 `
+            -Owner $repoParts[0] `
+            -Repo $repoParts[1] `
+            -Tag "${{ inputs.release_tag }}" `
+            -AssetPath "${{ steps.nuitka_build.outputs.asset_path }}" `
+            -AssetName "${{ steps.cfg.outputs.asset_name }}" `
+            -Token $env:PRIVATE_RELEASE_TOKEN

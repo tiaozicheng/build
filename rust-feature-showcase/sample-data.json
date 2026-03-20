@@ -1,0 +1,61 @@
+{
+  "name": "public-showcase-plan",
+  "created_by": "tiaozicheng/build",
+  "items": [
+    {
+      "id": "bootstrap",
+      "title": "Bootstrap the repository",
+      "owner": "alice",
+      "priority": "critical",
+      "state": "done",
+      "estimate_hours": 6,
+      "tags": ["repo", "setup"],
+      "blocked_by": [],
+      "notes": "Create the first useful project in the public repo."
+    },
+    {
+      "id": "cli",
+      "title": "Design a CLI surface",
+      "owner": "alice",
+      "priority": "high",
+      "state": "in_progress",
+      "estimate_hours": 12,
+      "tags": ["cli", "ux"],
+      "blocked_by": [],
+      "notes": "Keep commands discoverable and script friendly."
+    },
+    {
+      "id": "score",
+      "title": "Implement scoring strategies",
+      "owner": "bob",
+      "priority": "high",
+      "state": "todo",
+      "estimate_hours": 10,
+      "tags": ["traits", "collections"],
+      "blocked_by": ["cli"],
+      "notes": "Use multiple strategies to rank items."
+    },
+    {
+      "id": "parallel",
+      "title": "Parallelize scoring work",
+      "owner": "carol",
+      "priority": "medium",
+      "state": "blocked",
+      "estimate_hours": 16,
+      "tags": ["threads", "performance"],
+      "blocked_by": ["score"],
+      "notes": "Distribute work across threads."
+    },
+    {
+      "id": "report",
+      "title": "Render reports as text and JSON",
+      "owner": null,
+      "priority": "medium",
+      "state": "todo",
+      "estimate_hours": 8,
+      "tags": ["serde", "reporting"],
+      "blocked_by": ["score"],
+      "notes": "Expose results to humans and tooling."
+    }
+  ]
+}

@@ -1,0 +1,166 @@
+name: 构建-rust
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "私有源码仓库，格式 owner/repo"
+        required: true
+        type: string
+      source_sha:
+        description: "私有源码仓库中的提交 SHA"
+        required: true
+        type: string
+      project_path:
+        description: "项目路径，例如 projects/rust/NeighborLinker"
+        required: true
+        type: string
+      project_name:
+        description: "项目名，例如 NeighborLinker"
+        required: true
+        type: string
+      release_tag:
+        description: "私有仓库中的 Release 标签"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: 检出私有源码仓库
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.PRIVATE_SOURCE_READ_TOKEN }}
+          sparse-checkout: |
+            ${{ inputs.project_path }}
+            scripts/release/Upload-ToPrivateRelease.ps1
+            scripts/common/Invoke-WithRetry.ps1
+
+      - name: 加载项目构建配置
+        id: cfg
+        shell: pwsh
+        run: |
+          $projectRoot = Join-Path "${{ github.workspace }}" "${{ inputs.project_path }}"
+          $configPath = Join-Path $projectRoot "build.public.json"
+
+          $binaryName = "${{ inputs.project_name }}"
+          $assetName = "${{ inputs.project_name }}-windows-x64.zip"
+          $cargoArgsJson = "[]"
+          $artifactFilesJson = "[]"
+
+          if (Test-Path -Path $configPath) {
+            $raw = Get-Content -Path $configPath -Raw
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+              $config = $raw | ConvertFrom-Json
+              if ($config.PSObject.Properties["rust"] -and $config.rust) {
+                if ($config.rust.PSObject.Properties["binary_name"] -and -not [string]::IsNullOrWhiteSpace($config.rust.binary_name)) {
+                  $binaryName = [string]$config.rust.binary_name
+                }
+                if ($config.rust.PSObject.Properties["asset_name"] -and -not [string]::IsNullOrWhiteSpace($config.rust.asset_name)) {
+                  $assetName = [string]$config.rust.asset_name
+                }
+                if ($config.rust.PSObject.Properties["cargo_args"] -and $config.rust.cargo_args) {
+                  $cargoArgsJson = @($config.rust.cargo_args) | ConvertTo-Json -Compress
+                }
+                if ($config.rust.PSObject.Properties["artifact_files"] -and $config.rust.artifact_files) {
+                  $artifactFilesJson = @($config.rust.artifact_files) | ConvertTo-Json -Compress
+                }
+              }
+            }
+          }
+
+          "binary_name=$binaryName" >> $env:GITHUB_OUTPUT
+          "asset_name=$assetName" >> $env:GITHUB_OUTPUT
+          "cargo_args_json=$cargoArgsJson" >> $env:GITHUB_OUTPUT
+          "artifact_files_json=$artifactFilesJson" >> $env:GITHUB_OUTPUT
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 构建 Rust 项目
+        shell: pwsh
+        run: |
+          $manifestPath = Join-Path "${{ github.workspace }}" "${{ inputs.project_path }}/Cargo.toml"
+          $cargoArgs = '${{ steps.cfg.outputs.cargo_args_json }}' | ConvertFrom-Json
+          $args = @("build", "--release", "--manifest-path", "$manifestPath") + @($cargoArgs)
+          & cargo @args
+
+      - name: 打包构建产物
+        id: package
+        shell: pwsh
+        run: |
+          $projectRoot = Join-Path "${{ github.workspace }}" "${{ inputs.project_path }}"
+          $manifestPath = Join-Path $projectRoot "Cargo.toml"
+          $metadataJson = cargo metadata --format-version 1 --no-deps --manifest-path "$manifestPath"
+          $metadata = $metadataJson | ConvertFrom-Json
+          $releaseDir = Join-Path $metadata.target_directory "release"
+          if (-not (Test-Path -Path $releaseDir)) {
+            throw "Rust release directory not found: $releaseDir"
+          }
+
+          $preferredBinary = Join-Path $releaseDir "${{ steps.cfg.outputs.binary_name }}.exe"
+          if (Test-Path -Path $preferredBinary) {
+            $binaryPath = $preferredBinary
+          } else {
+            $candidate = Get-ChildItem -Path $releaseDir -Filter *.exe -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $candidate) {
+              throw "No executable artifact found in: $releaseDir"
+            }
+            $binaryPath = $candidate.FullName
+          }
+
+          $stagingDir = Join-Path "${{ runner.temp }}" "${{ inputs.project_name }}-staging"
+          if (Test-Path -Path $stagingDir) {
+            Remove-Item -Path $stagingDir -Recurse -Force
+          }
+          New-Item -Path $stagingDir -ItemType Directory -Force | Out-Null
+
+          Copy-Item -Path $binaryPath -Destination $stagingDir -Force
+
+          $artifactFiles = '${{ steps.cfg.outputs.artifact_files_json }}' | ConvertFrom-Json
+          foreach ($relative in @($artifactFiles)) {
+            if ([string]::IsNullOrWhiteSpace($relative)) {
+              continue
+            }
+
+            $sourcePath = Join-Path $projectRoot $relative
+            if (-not (Test-Path -Path $sourcePath)) {
+              Write-Warning "artifact file not found: $sourcePath"
+              continue
+            }
+
+            $targetPath = Join-Path $stagingDir (Split-Path -Path $relative -Leaf)
+            Copy-Item -Path $sourcePath -Destination $targetPath -Recurse -Force
+          }
+
+          $zipPath = Join-Path "${{ runner.temp }}" "${{ inputs.project_name }}-${{ inputs.source_sha }}-windows-x64.zip"
+          Compress-Archive -Path (Join-Path $stagingDir "*") -DestinationPath $zipPath -Force
+          "asset_path=$zipPath" >> $env:GITHUB_OUTPUT
+
+      - name: 上传产物到私有 Release
+        shell: pwsh
+        env:
+          PRIVATE_RELEASE_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
+        run: |
+          if (-not $env:PRIVATE_RELEASE_TOKEN) {
+            throw "Missing secret: PRIVATE_RELEASE_TOKEN"
+          }
+
+          $repoParts = "${{ inputs.source_repo }}".Split("/")
+          if ($repoParts.Count -ne 2) {
+            throw "source_repo must be owner/repo"
+          }
+
+          ./scripts/release/Upload-ToPrivateRelease.ps1 `
+            -Owner $repoParts[0] `
+            -Repo $repoParts[1] `
+            -Tag "${{ inputs.release_tag }}" `
+            -AssetPath "${{ steps.package.outputs.asset_path }}" `
+            -AssetName "${{ steps.cfg.outputs.asset_name }}" `
+            -Token $env:PRIVATE_RELEASE_TOKEN

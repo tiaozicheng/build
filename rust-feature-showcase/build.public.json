@@ -1,0 +1,10 @@
+{
+  "rust": {
+    "binary_name": "rust-feature-showcase",
+    "asset_name": "rust-feature-showcase-windows-x64.zip",
+    "artifact_files": [
+      "README.md",
+      "sample-data.json"
+    ]
+  }
+}
