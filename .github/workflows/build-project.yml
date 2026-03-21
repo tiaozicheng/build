@@ -1,0 +1,147 @@
+name: 构建-project
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "私有源码仓库，格式 owner/repo"
+        required: true
+        type: string
+      source_sha:
+        description: "私有源码仓库中的提交 SHA"
+        required: true
+        type: string
+      project_path:
+        description: "项目路径，例如 projects/rust/cmcc_report"
+        required: true
+        type: string
+      project_name:
+        description: "项目名，例如 cmcc_report"
+        required: true
+        type: string
+      project_language:
+        description: "项目语言，例如 rust 或 python"
+        required: true
+        type: choice
+        options:
+          - rust
+          - python
+      release_tag:
+        description: "私有仓库中的 Release 标签"
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.source_repo }}-${{ inputs.project_path }}-${{ inputs.source_sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 检出公开仓库模板资源
+        uses: actions/checkout@v4
+
+      - name: 检出私有源码仓库
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.PRIVATE_SOURCE_READ_TOKEN }}
+          path: source
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 加载项目构建参数
+        id: cfg
+        run: |
+          set -euo pipefail
+
+          python docs/public-workflows/scripts/export_build_config.py \
+            --project-root "source/${{ inputs.project_path }}" \
+            --project-name "${{ inputs.project_name }}" \
+            --project-language "${{ inputs.project_language }}" \
+            --output-file "${GITHUB_OUTPUT}"
+
+      - name: 安装 uv
+        if: inputs.project_language == 'python'
+        uses: astral-sh/setup-uv@v7
+
+      - name: 构建 Rust 项目
+        if: inputs.project_language == 'rust'
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: x86_64-pc-windows-msvc
+          working-directory: source/${{ inputs.project_path }}
+          args: ${{ steps.cfg.outputs.rust_args }}
+          strip: true
+          use-rust-cache: false
+
+      - name: 同步 Python 项目依赖
+        if: inputs.project_language == 'python'
+        run: |
+          set -euo pipefail
+
+          cd source
+          uv sync --package "${{ steps.cfg.outputs.python_uv_package_name }}"
+          printf 'VIRTUAL_ENV=%s\n' "${GITHUB_WORKSPACE}/source/.venv" >> "${GITHUB_ENV}"
+          printf '%s\n' "${GITHUB_WORKSPACE}/source/.venv/Scripts" >> "${GITHUB_PATH}"
+
+      - name: 使用 Nuitka Action 构建 Python 项目
+        if: inputs.project_language == 'python'
+        uses: Nuitka/Nuitka-Action@main
+        with:
+          nuitka-version: ${{ steps.cfg.outputs.python_nuitka_version }}
+          working-directory: source/${{ inputs.project_path }}
+          script-name: ${{ steps.cfg.outputs.python_entry_file }}
+          mode: ${{ steps.cfg.outputs.python_mode }}
+          output-file: ${{ steps.cfg.outputs.python_output_file }}
+          windows-icon-from-ico: ${{ steps.cfg.outputs.python_windows_icon_from_ico }}
+          include-data-files: ${{ steps.cfg.outputs.python_include_data_files }}
+          assume-yes-for-downloads: ${{ steps.cfg.outputs.python_assume_yes_for_downloads }}
+          file-description: ${{ steps.cfg.outputs.python_file_description }}
+          product-name: ${{ steps.cfg.outputs.python_product_name }}
+          company-name: ${{ steps.cfg.outputs.python_company_name }}
+          file-version: ${{ steps.cfg.outputs.python_file_version }}
+          product-version: ${{ steps.cfg.outputs.python_product_version }}
+          copyright: ${{ steps.cfg.outputs.python_copyright }}
+          trademarks: ${{ steps.cfg.outputs.python_trademarks }}
+
+      - name: 整理发布产物
+        id: package
+        run: |
+          set -euo pipefail
+
+          python docs/public-workflows/scripts/package_release_asset.py \
+            --source-root "source" \
+            --project-path "${{ inputs.project_path }}" \
+            --project-language "${{ inputs.project_language }}" \
+            --asset-name "${{ steps.cfg.outputs.asset_name }}" \
+            --runner-temp "${{ runner.temp }}" \
+            --output-file "${GITHUB_OUTPUT}" \
+            --rust-binary-name "${{ steps.cfg.outputs.rust_binary_name }}" \
+            --rust-artifact-files-json '${{ steps.cfg.outputs.rust_artifact_files_json }}' \
+            --python-output-file "${{ steps.cfg.outputs.python_output_file }}"
+
+      - name: 上传产物到私有 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ inputs.source_repo }}
+          token: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
+          tag_name: ${{ inputs.release_tag }}
+          target_commitish: ${{ inputs.source_sha }}
+          name: ${{ inputs.release_tag }}
+          files: ${{ steps.package.outputs.release_asset_path }}
+          fail_on_unmatched_files: true
+          overwrite_files: true
