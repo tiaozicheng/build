@@ -24,12 +24,20 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.source_repo }}-${{ inputs.project_path }}-${{ inputs.source_sha }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - name: 检出私有源码仓库
         uses: actions/checkout@v4
@@ -44,9 +52,38 @@ jobs:
 
       - name: 加载项目构建配置
         id: cfg
-        shell: pwsh
         run: |
-          $projectRoot = Join-Path "${{ github.workspace }}" "${{ inputs.project_path }}"
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+
+          function Get-ConfigValue {
+            param(
+              [Parameter(Mandatory = $true)]
+              [AllowNull()]
+              [object]$Section,
+              [Parameter(Mandatory = $true)]
+              [string]$Name,
+              [AllowNull()]
+              [object]$DefaultValue
+            )
+
+            if ($null -eq $Section -or -not $Section.PSObject.Properties[$Name]) {
+              return $DefaultValue
+            }
+
+            $value = $Section.$Name
+            if ($null -eq $value) {
+              return $DefaultValue
+            }
+
+            if ($value -is [string] -and [string]::IsNullOrWhiteSpace($value)) {
+              return $DefaultValue
+            }
+
+            return $value
+          }
+
+          $projectRoot = Join-Path $env:GITHUB_WORKSPACE "${{ inputs.project_path }}"
           $configPath = Join-Path $projectRoot "build.public.json"
 
           $binaryName = "${{ inputs.project_name }}"
@@ -58,44 +95,50 @@ jobs:
             $raw = Get-Content -Path $configPath -Raw
             if (-not [string]::IsNullOrWhiteSpace($raw)) {
               $config = $raw | ConvertFrom-Json
-              if ($config.PSObject.Properties["rust"] -and $config.rust) {
-                if ($config.rust.PSObject.Properties["binary_name"] -and -not [string]::IsNullOrWhiteSpace($config.rust.binary_name)) {
-                  $binaryName = [string]$config.rust.binary_name
-                }
-                if ($config.rust.PSObject.Properties["asset_name"] -and -not [string]::IsNullOrWhiteSpace($config.rust.asset_name)) {
-                  $assetName = [string]$config.rust.asset_name
-                }
-                if ($config.rust.PSObject.Properties["cargo_args"] -and $config.rust.cargo_args) {
-                  $cargoArgsJson = @($config.rust.cargo_args) | ConvertTo-Json -Compress
-                }
-                if ($config.rust.PSObject.Properties["artifact_files"] -and $config.rust.artifact_files) {
-                  $artifactFilesJson = @($config.rust.artifact_files) | ConvertTo-Json -Compress
-                }
-              }
+              $rustConfig = Get-ConfigValue -Section $config -Name "rust" -DefaultValue $null
+              $binaryName = [string](Get-ConfigValue -Section $rustConfig -Name "binary_name" -DefaultValue $binaryName)
+              $assetName = [string](Get-ConfigValue -Section $rustConfig -Name "asset_name" -DefaultValue $assetName)
+              $cargoArgsJson = @((Get-ConfigValue -Section $rustConfig -Name "cargo_args" -DefaultValue @())) | ConvertTo-Json -Compress
+              $artifactFilesJson = @((Get-ConfigValue -Section $rustConfig -Name "artifact_files" -DefaultValue @())) | ConvertTo-Json -Compress
             }
           }
 
-          "binary_name=$binaryName" >> $env:GITHUB_OUTPUT
-          "asset_name=$assetName" >> $env:GITHUB_OUTPUT
-          "cargo_args_json=$cargoArgsJson" >> $env:GITHUB_OUTPUT
-          "artifact_files_json=$artifactFilesJson" >> $env:GITHUB_OUTPUT
+          @(
+            "binary_name=$binaryName"
+            "asset_name=$assetName"
+            "cargo_args_json=$cargoArgsJson"
+            "artifact_files_json=$artifactFilesJson"
+          ) | Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
 
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ${{ inputs.project_path }} -> target
+
       - name: 构建 Rust 项目
-        shell: pwsh
         run: |
-          $manifestPath = Join-Path "${{ github.workspace }}" "${{ inputs.project_path }}/Cargo.toml"
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-StrictMode -Version Latest
+
+          $projectRoot = Join-Path $env:GITHUB_WORKSPACE "${{ inputs.project_path }}"
+          $manifestPath = Join-Path $projectRoot "Cargo.toml"
           $cargoArgs = '${{ steps.cfg.outputs.cargo_args_json }}' | ConvertFrom-Json
           $args = @("build", "--release", "--manifest-path", "$manifestPath") + @($cargoArgs)
           & cargo @args
 
       - name: 打包构建产物
         id: package
-        shell: pwsh
         run: |
-          $projectRoot = Join-Path "${{ github.workspace }}" "${{ inputs.project_path }}"
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-StrictMode -Version Latest
+
+          $projectRoot = Join-Path $env:GITHUB_WORKSPACE "${{ inputs.project_path }}"
           $manifestPath = Join-Path $projectRoot "Cargo.toml"
           $metadataJson = cargo metadata --format-version 1 --no-deps --manifest-path "$manifestPath"
           $metadata = $metadataJson | ConvertFrom-Json
@@ -115,7 +158,7 @@ jobs:
             $binaryPath = $candidate.FullName
           }
 
-          $stagingDir = Join-Path "${{ runner.temp }}" "${{ inputs.project_name }}-staging"
+          $stagingDir = Join-Path $env:RUNNER_TEMP "${{ inputs.project_name }}-staging"
           if (Test-Path -Path $stagingDir) {
             Remove-Item -Path $stagingDir -Recurse -Force
           }
@@ -139,15 +182,17 @@ jobs:
             Copy-Item -Path $sourcePath -Destination $targetPath -Recurse -Force
           }
 
-          $zipPath = Join-Path "${{ runner.temp }}" "${{ inputs.project_name }}-${{ inputs.source_sha }}-windows-x64.zip"
+          $zipPath = Join-Path $env:RUNNER_TEMP "${{ inputs.project_name }}-${{ inputs.source_sha }}-windows-x64.zip"
           Compress-Archive -Path (Join-Path $stagingDir "*") -DestinationPath $zipPath -Force
-          "asset_path=$zipPath" >> $env:GITHUB_OUTPUT
+          "asset_path=$zipPath" | Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8
 
       - name: 上传产物到私有 Release
-        shell: pwsh
         env:
           PRIVATE_RELEASE_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
         run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+
           if (-not $env:PRIVATE_RELEASE_TOKEN) {
             throw "Missing secret: PRIVATE_RELEASE_TOKEN"
           }
