@@ -15,12 +15,19 @@ def package_rust_asset(
     project_root: pathlib.Path,
     runner_temp: pathlib.Path,
     asset_name: str,
+    rust_target: str,
     rust_binary_name: str,
     rust_artifact_files_json: str,
 ) -> pathlib.Path:
-    release_dir = source_root / "target" / "release"
-    if not release_dir.is_dir():
-        raise SystemExit(f"Rust release 目录不存在：{release_dir}")
+    release_dir_candidates = []
+    if rust_target:
+        release_dir_candidates.append(source_root / "target" / rust_target / "release")
+    release_dir_candidates.append(source_root / "target" / "release")
+
+    release_dir = next((path for path in release_dir_candidates if path.is_dir()), None)
+    if release_dir is None:
+        candidates_text = "、".join(str(path) for path in release_dir_candidates)
+        raise SystemExit(f"Rust release 目录不存在：{candidates_text}")
 
     binary_path = release_dir / f"{rust_binary_name}.exe"
     if not binary_path.exists():
@@ -94,6 +101,7 @@ def main() -> None:
     parser.add_argument("--asset-name", required=True)
     parser.add_argument("--runner-temp", required=True)
     parser.add_argument("--output-file", required=True)
+    parser.add_argument("--rust-target", default="")
     parser.add_argument("--rust-binary-name", default="")
     parser.add_argument("--rust-artifact-files-json", default="[]")
     parser.add_argument("--python-output-file", default="")
@@ -110,6 +118,7 @@ def main() -> None:
             project_root=project_root,
             runner_temp=runner_temp,
             asset_name=args.asset_name,
+            rust_target=args.rust_target,
             rust_binary_name=args.rust_binary_name,
             rust_artifact_files_json=args.rust_artifact_files_json,
         )

@@ -83,8 +83,8 @@ jobs:
         with:
           command: build
           target: x86_64-pc-windows-msvc
-          working-directory: source/${{ inputs.project_path }}
-          args: ${{ steps.cfg.outputs.rust_args }}
+          working-directory: source
+          args: --manifest-path ${{ inputs.project_path }}/Cargo.toml ${{ steps.cfg.outputs.rust_args }}
           strip: true
           use-rust-cache: false
 
@@ -130,6 +130,7 @@ jobs:
             --asset-name "${{ steps.cfg.outputs.asset_name }}" \
             --runner-temp "${{ runner.temp }}" \
             --output-file "${GITHUB_OUTPUT}" \
+            --rust-target "x86_64-pc-windows-msvc" \
             --rust-binary-name "${{ steps.cfg.outputs.rust_binary_name }}" \
             --rust-artifact-files-json '${{ steps.cfg.outputs.rust_artifact_files_json }}' \
             --python-output-file "${{ steps.cfg.outputs.python_output_file }}"
