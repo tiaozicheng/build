@@ -20,9 +20,11 @@ def package_rust_asset(
     rust_artifact_files_json: str,
 ) -> pathlib.Path:
     release_dir_candidates = []
-    if rust_target:
-        release_dir_candidates.append(source_root / "target" / rust_target / "release")
-    release_dir_candidates.append(source_root / "target" / "release")
+    target_roots = [project_root / "target", source_root / "target"]
+    for target_root in target_roots:
+        if rust_target:
+            release_dir_candidates.append(target_root / rust_target / "release")
+        release_dir_candidates.append(target_root / "release")
 
     release_dir = next((path for path in release_dir_candidates if path.is_dir()), None)
     if release_dir is None:
