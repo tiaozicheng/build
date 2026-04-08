@@ -84,7 +84,7 @@ jobs:
           command: build
           target: x86_64-pc-windows-msvc
           working-directory: source
-          args: --manifest-path ${{ inputs.project_path }}/Cargo.toml ${{ steps.cfg.outputs.rust_args }}
+          args: --manifest-path ${{ inputs.project_path }}/Cargo.toml --locked ${{ steps.cfg.outputs.rust_args }}
           strip: true
           use-rust-cache: false
 
@@ -93,10 +93,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          cd source
-          uv sync --package "${{ steps.cfg.outputs.python_uv_package_name }}"
-          printf 'VIRTUAL_ENV=%s\n' "${GITHUB_WORKSPACE}/source/.venv" >> "${GITHUB_ENV}"
-          printf '%s\n' "${GITHUB_WORKSPACE}/source/.venv/Scripts" >> "${GITHUB_PATH}"
+          cd "source/${{ inputs.project_path }}"
+          uv sync --locked
+          printf 'VIRTUAL_ENV=%s\n' "${GITHUB_WORKSPACE}/source/${{ inputs.project_path }}/.venv" >> "${GITHUB_ENV}"
+          printf '%s\n' "${GITHUB_WORKSPACE}/source/${{ inputs.project_path }}/.venv/Scripts" >> "${GITHUB_PATH}"
 
       - name: 使用 Nuitka Action 构建 Python 项目
         if: inputs.project_language == 'python'

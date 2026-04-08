@@ -62,7 +62,6 @@ def export_python_config(output_path: pathlib.Path, project_name: str, config: d
         raise SystemExit("python.include_data_files 必须是数组。")
 
     write_scalar(output_path, "asset_name", str(python_config.get("asset_name") or f"{project_name}-windows-x64.exe"))
-    write_scalar(output_path, "python_uv_package_name", str(python_config.get("uv_package_name") or project_name))
     write_scalar(output_path, "python_entry_file", str(python_config.get("entry_file") or "main.py"))
     write_scalar(output_path, "python_mode", str(python_config.get("mode") or "onefile"))
     write_scalar(output_path, "python_output_file", str(python_config.get("output_filename") or f"{project_name}.exe"))
