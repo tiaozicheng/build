@@ -1,47 +1,155 @@
 name: 构建-project
 
 on:
-  workflow_dispatch:
-    inputs:
-      source_repo:
-        description: "私有源码仓库，格式 owner/repo"
-        required: true
-        type: string
-      source_sha:
-        description: "私有源码仓库中的提交 SHA"
-        required: true
-        type: string
-      project_path:
-        description: "项目路径，例如 projects/rust/cmcc_report"
-        required: true
-        type: string
-      project_name:
-        description: "项目名，例如 cmcc_report"
-        required: true
-        type: string
-      project_language:
-        description: "项目语言，例如 rust 或 python"
-        required: true
-        type: choice
-        options:
-          - rust
-          - python
-      release_tag:
-        description: "私有仓库中的 Release 标签"
-        required: true
-        type: string
+  repository_dispatch:
+    types:
+      - private-source-push
 
 concurrency:
-  group: ${{ github.workflow }}-${{ inputs.source_repo }}-${{ inputs.project_path }}-${{ inputs.source_sha }}
+  group: ${{ github.workflow }}-${{ github.event.client_payload.source_repo || github.repository }}-${{ github.event.client_payload.source_ref || 'refs/heads/main' }}
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      source_repo: ${{ steps.request.outputs.source_repo }}
+      source_ref: ${{ steps.request.outputs.source_ref }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      release_tag: ${{ steps.source.outputs.release_tag }}
+      matrix: ${{ steps.detect.outputs.matrix }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+    steps:
+      - name: 检出公开仓库模板资源
+        uses: actions/checkout@v4
+
+      - name: 解析构建请求
+        id: request
+        shell: bash
+        env:
+          REQUEST_SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
+          REQUEST_SOURCE_REF: ${{ github.event.client_payload.source_ref }}
+          REQUEST_BEFORE: ${{ github.event.client_payload.before }}
+          REQUEST_AFTER: ${{ github.event.client_payload.after }}
+          REQUEST_FORCE_PROJECT_LANGUAGE: ${{ github.event.client_payload.force_project_language }}
+          REQUEST_FORCE_PROJECT_NAME: ${{ github.event.client_payload.force_project_name }}
+          REQUEST_FORCE_ALL_PROJECTS: ${{ github.event.client_payload.force_all_projects }}
+        run: |
+          set -euo pipefail
+
+          source_repo="${REQUEST_SOURCE_REPO:-}"
+          source_ref="${REQUEST_SOURCE_REF:-refs/heads/main}"
+          before_ref="${REQUEST_BEFORE:-}"
+          after_ref="${REQUEST_AFTER:-}"
+          force_project_language="${REQUEST_FORCE_PROJECT_LANGUAGE:-}"
+          force_project_name="${REQUEST_FORCE_PROJECT_NAME:-}"
+          force_all_projects="${REQUEST_FORCE_ALL_PROJECTS:-false}"
+
+          if [[ -z "${source_repo}" ]]; then
+            echo "Missing source_repo" >&2
+            exit 1
+          fi
+
+          if [[ -n "${force_project_name}" && -z "${force_project_language}" ]]; then
+            echo "force_project_name 提供时必须同时提供 force_project_language。" >&2
+            exit 1
+          fi
+
+          checkout_ref="${after_ref:-${source_ref}}"
+
+          printf 'source_repo=%s\n' "${source_repo}" >> "${GITHUB_OUTPUT}"
+          printf 'source_ref=%s\n' "${source_ref}" >> "${GITHUB_OUTPUT}"
+          printf 'before_ref=%s\n' "${before_ref}" >> "${GITHUB_OUTPUT}"
+          printf 'after_ref=%s\n' "${after_ref}" >> "${GITHUB_OUTPUT}"
+          printf 'checkout_ref=%s\n' "${checkout_ref}" >> "${GITHUB_OUTPUT}"
+          printf 'force_project_language=%s\n' "${force_project_language}" >> "${GITHUB_OUTPUT}"
+          printf 'force_project_name=%s\n' "${force_project_name}" >> "${GITHUB_OUTPUT}"
+          printf 'force_all_projects=%s\n' "${force_all_projects}" >> "${GITHUB_OUTPUT}"
+
+      - name: 检出私有源码仓库
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.request.outputs.source_repo }}
+          ref: ${{ steps.request.outputs.checkout_ref }}
+          token: ${{ secrets.PRIVATE_SOURCE_READ_TOKEN }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 解析目标源码提交
+        id: source
+        shell: bash
+        env:
+          REQUESTED_AFTER_REF: ${{ steps.request.outputs.after_ref }}
+        run: |
+          set -euo pipefail
+
+          source_sha="${REQUESTED_AFTER_REF:-}"
+          if [[ -z "${source_sha}" ]]; then
+            source_sha="$(git -C source rev-parse HEAD)"
+          fi
+
+          git -C source rev-parse --verify "${source_sha}^{commit}" >/dev/null
+
+          release_tag="$(cd source && bash ./scripts/ci/new_release_tag.sh "${source_sha}")"
+
+          printf 'source_sha=%s\n' "${source_sha}" >> "${GITHUB_OUTPUT}"
+          printf 'release_tag=%s\n' "${release_tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: 识别受影响项目
+        id: detect
+        shell: bash
+        env:
+          BEFORE_REF: ${{ steps.request.outputs.before_ref }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+          FORCE_PROJECT_LANGUAGE: ${{ steps.request.outputs.force_project_language }}
+          FORCE_PROJECT_NAME: ${{ steps.request.outputs.force_project_name }}
+          FORCE_ALL_PROJECTS: ${{ steps.request.outputs.force_all_projects }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${FORCE_PROJECT_NAME}" ]]; then
+            project_path="projects/${FORCE_PROJECT_LANGUAGE}/${FORCE_PROJECT_NAME}"
+            config_path="source/${project_path}/build.public.json"
+
+            if [[ ! -d "source/${project_path}" ]]; then
+              echo "手动触发项目不存在：${project_path}" >&2
+              exit 1
+            fi
+
+            if [[ ! -f "${config_path}" ]]; then
+              echo "手动触发项目缺少构建参数文件：${config_path}" >&2
+              exit 1
+            fi
+
+            matrix="$(python3 -c 'import json, os; language = os.environ["FORCE_PROJECT_LANGUAGE"]; name = os.environ["FORCE_PROJECT_NAME"]; print(json.dumps([{"language": language, "name": name, "path": f"projects/{language}/{name}"}], ensure_ascii=False))')"
+          else
+            matrix="$(cd source && FORCE_ALL_PROJECTS="${FORCE_ALL_PROJECTS:-false}" bash ./scripts/ci/detect_changed_projects.sh "${BEFORE_REF}" "${SOURCE_SHA}")"
+          fi
+
+          if [[ "${matrix}" == "[]" ]]; then
+            has_changes=false
+          else
+            has_changes=true
+          fi
+
+          printf 'matrix=%s\n' "${matrix}" >> "${GITHUB_OUTPUT}"
+          printf 'has_changes=%s\n' "${has_changes}" >> "${GITHUB_OUTPUT}"
+          echo "Detected matrix: ${matrix}"
+
   build:
+    needs: resolve
+    if: needs.resolve.outputs.has_changes == 'true'
     runs-on: windows-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJson(needs.resolve.outputs.matrix) }}
     defaults:
       run:
         shell: bash
@@ -52,15 +160,42 @@ jobs:
       - name: 检出私有源码仓库
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.source_repo }}
-          ref: ${{ inputs.source_sha }}
+          repository: ${{ needs.resolve.outputs.source_repo }}
+          ref: ${{ needs.resolve.outputs.source_sha }}
           token: ${{ secrets.PRIVATE_SOURCE_READ_TOKEN }}
           path: source
+          persist-credentials: false
 
       - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: 回写私有仓库状态为 pending
+        run: |
+          set -euo pipefail
+
+          status_token="${PRIVATE_STATUS_TOKEN:-}"
+          if [[ -z "${status_token}" ]]; then
+            status_token="${PRIVATE_RELEASE_TOKEN:-}"
+          fi
+
+          if [[ -z "${status_token}" ]]; then
+            echo "Missing secret: PRIVATE_STATUS_TOKEN or PRIVATE_RELEASE_TOKEN" >&2
+            exit 1
+          fi
+
+          python docs/public-workflows/scripts/report_private_build_status.py \
+            --source-repo "${{ needs.resolve.outputs.source_repo }}" \
+            --source-sha "${{ needs.resolve.outputs.source_sha }}" \
+            --token "${status_token}" \
+            --state pending \
+            --context "public-build/${{ matrix.project.language }}/${{ matrix.project.name }}" \
+            --description "公开仓库构建已启动" \
+            --target-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        env:
+          PRIVATE_STATUS_TOKEN: ${{ secrets.PRIVATE_STATUS_TOKEN }}
+          PRIVATE_RELEASE_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
 
       - name: 加载项目构建参数
         id: cfg
@@ -68,43 +203,43 @@ jobs:
           set -euo pipefail
 
           python docs/public-workflows/scripts/export_build_config.py \
-            --project-root "source/${{ inputs.project_path }}" \
-            --project-name "${{ inputs.project_name }}" \
-            --project-language "${{ inputs.project_language }}" \
+            --project-root "source/${{ matrix.project.path }}" \
+            --project-name "${{ matrix.project.name }}" \
+            --project-language "${{ matrix.project.language }}" \
             --output-file "${GITHUB_OUTPUT}"
 
       - name: 安装 uv
-        if: inputs.project_language == 'python'
+        if: matrix.project.language == 'python'
         uses: astral-sh/setup-uv@v7
 
       - name: 构建 Rust 项目
-        if: inputs.project_language == 'rust'
+        if: matrix.project.language == 'rust'
         uses: houseabsolute/actions-rust-cross@v1
         with:
           command: build
           target: x86_64-pc-windows-msvc
-          working-directory: source/${{ inputs.project_path }}
+          working-directory: source/${{ matrix.project.path }}
           args: --locked ${{ steps.cfg.outputs.rust_args }}
           strip: true
           use-rust-cache: false
 
       - name: 同步 Python 项目依赖
-        if: inputs.project_language == 'python'
+        if: matrix.project.language == 'python'
         run: |
           set -euo pipefail
 
-          cd "source/${{ inputs.project_path }}"
+          cd "source/${{ matrix.project.path }}"
           uv venv --seed
           uv sync --locked
-          printf 'VIRTUAL_ENV=%s\n' "${GITHUB_WORKSPACE}/source/${{ inputs.project_path }}/.venv" >> "${GITHUB_ENV}"
-          printf '%s\n' "${GITHUB_WORKSPACE}/source/${{ inputs.project_path }}/.venv/Scripts" >> "${GITHUB_PATH}"
+          printf 'VIRTUAL_ENV=%s\n' "${GITHUB_WORKSPACE}/source/${{ matrix.project.path }}/.venv" >> "${GITHUB_ENV}"
+          printf '%s\n' "${GITHUB_WORKSPACE}/source/${{ matrix.project.path }}/.venv/Scripts" >> "${GITHUB_PATH}"
 
       - name: 使用 Nuitka Action 构建 Python 项目
-        if: inputs.project_language == 'python'
+        if: matrix.project.language == 'python'
         uses: Nuitka/Nuitka-Action@main
         with:
           nuitka-version: ${{ steps.cfg.outputs.python_nuitka_version }}
-          working-directory: source/${{ inputs.project_path }}
+          working-directory: source/${{ matrix.project.path }}
           script-name: ${{ steps.cfg.outputs.python_entry_file }}
           mode: ${{ steps.cfg.outputs.python_mode }}
           output-file: ${{ steps.cfg.outputs.python_output_file }}
@@ -126,8 +261,8 @@ jobs:
 
           python docs/public-workflows/scripts/package_release_asset.py \
             --source-root "source" \
-            --project-path "${{ inputs.project_path }}" \
-            --project-language "${{ inputs.project_language }}" \
+            --project-path "${{ matrix.project.path }}" \
+            --project-language "${{ matrix.project.language }}" \
             --asset-name "${{ steps.cfg.outputs.asset_name }}" \
             --runner-temp "${{ runner.temp }}" \
             --output-file "${GITHUB_OUTPUT}" \
@@ -139,11 +274,54 @@ jobs:
       - name: 上传产物到私有 Release
         uses: softprops/action-gh-release@v2
         with:
-          repository: ${{ inputs.source_repo }}
+          repository: ${{ needs.resolve.outputs.source_repo }}
           token: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
-          tag_name: ${{ inputs.release_tag }}
-          target_commitish: ${{ inputs.source_sha }}
-          name: ${{ inputs.release_tag }}
+          tag_name: ${{ needs.resolve.outputs.release_tag }}
+          target_commitish: ${{ needs.resolve.outputs.source_sha }}
+          name: ${{ needs.resolve.outputs.release_tag }}
           files: ${{ steps.package.outputs.release_asset_path }}
           fail_on_unmatched_files: true
           overwrite_files: true
+
+      - name: 回写私有仓库最终状态
+        if: always()
+        run: |
+          set -euo pipefail
+
+          status_token="${PRIVATE_STATUS_TOKEN:-}"
+          if [[ -z "${status_token}" ]]; then
+            status_token="${PRIVATE_RELEASE_TOKEN:-}"
+          fi
+
+          if [[ -z "${status_token}" ]]; then
+            echo "Missing secret: PRIVATE_STATUS_TOKEN or PRIVATE_RELEASE_TOKEN" >&2
+            exit 1
+          fi
+
+          case "${JOB_STATUS}" in
+            success)
+              state="success"
+              description="公开仓库构建成功"
+              ;;
+            cancelled)
+              state="error"
+              description="公开仓库构建已取消"
+              ;;
+            *)
+              state="failure"
+              description="公开仓库构建失败"
+              ;;
+          esac
+
+          python docs/public-workflows/scripts/report_private_build_status.py \
+            --source-repo "${{ needs.resolve.outputs.source_repo }}" \
+            --source-sha "${{ needs.resolve.outputs.source_sha }}" \
+            --token "${status_token}" \
+            --state "${state}" \
+            --context "public-build/${{ matrix.project.language }}/${{ matrix.project.name }}" \
+            --description "${description}" \
+            --target-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        env:
+          JOB_STATUS: ${{ job.status }}
+          PRIVATE_STATUS_TOKEN: ${{ secrets.PRIVATE_STATUS_TOKEN }}
+          PRIVATE_RELEASE_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
