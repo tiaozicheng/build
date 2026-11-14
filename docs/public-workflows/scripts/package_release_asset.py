@@ -10,6 +10,28 @@ def append_output(output_path: pathlib.Path, name: str, value: str) -> None:
         handle.write(f"{name}={value}\n")
 
 
+def read_rust_binary_name(project_root: pathlib.Path) -> str:
+    """直接从 build.public.json 读取二进制名。
+
+    该值可能包含中文（例如「保障通报」）。命令行参数在 Windows runner 上会丢失
+    非 ASCII 字符，因此以配置文件为权威来源，参数只作为兜底。
+    """
+    config_path = project_root / "build.public.json"
+    if not config_path.is_file():
+        return ""
+
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+
+    rust_config = config.get("rust")
+    if not isinstance(rust_config, dict):
+        return ""
+
+    return str(rust_config.get("binary_name") or "")
+
+
 def package_rust_asset(
     source_root: pathlib.Path,
     project_root: pathlib.Path,
@@ -31,8 +53,17 @@ def package_rust_asset(
         candidates_text = "、".join(str(path) for path in release_dir_candidates)
         raise SystemExit(f"Rust release 目录不存在：{candidates_text}")
 
-    binary_path = release_dir / f"{rust_binary_name}.exe"
-    if not binary_path.exists():
+    config_binary_name = read_rust_binary_name(project_root)
+    binary_names = [name for name in (config_binary_name, rust_binary_name) if name]
+
+    binary_path = None
+    for name in binary_names:
+        candidate = release_dir / f"{name}.exe"
+        if candidate.exists():
+            binary_path = candidate
+            break
+
+    if binary_path is None:
         candidates = sorted(release_dir.glob("*.exe"), key=lambda path: path.stat().st_mtime, reverse=True)
         if not candidates:
             raise SystemExit(f"未找到 Rust 可执行产物：{release_dir}")

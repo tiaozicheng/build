@@ -6,8 +6,12 @@ on:
       - private-source-push
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.client_payload.source_repo || github.repository }}-${{ github.event.client_payload.source_ref || 'refs/heads/main' }}
-  cancel-in-progress: true
+  # 按目标提交拆组，而不是按分支。GitHub 的并发组最多容纳 1 个运行 + 1 个排队，
+  # 多余的直接丢弃；若按分支分组，连续推送会把正在构建的那次取消掉，而被取消
+  # 的项目只出现在那一次的 diff 里，之后再也不会补建，产物就停在旧版本。
+  # 公开仓库的 Actions 额度免费，并行构建的代价远低于漏构建。
+  group: ${{ github.workflow }}-${{ github.event.client_payload.source_repo || github.repository }}-${{ github.event.client_payload.after || github.run_id }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -21,6 +25,7 @@ jobs:
       source_ref: ${{ steps.request.outputs.source_ref }}
       source_sha: ${{ steps.source.outputs.source_sha }}
       release_tag: ${{ steps.source.outputs.release_tag }}
+      release_title: ${{ steps.source.outputs.release_title }}
       matrix: ${{ steps.detect.outputs.matrix }}
       has_changes: ${{ steps.detect.outputs.has_changes }}
     steps:
@@ -77,6 +82,10 @@ jobs:
           ref: ${{ steps.request.outputs.checkout_ref }}
           token: ${{ secrets.PRIVATE_SOURCE_READ_TOKEN }}
           path: source
+          # 本 job 只读提交图和目录树：变更检测用 git diff --name-only，标签与标题
+          # 用 git show -s，都不读文件内容。blob:none 跳过全部历史文件内容，
+          # 该仓库完整克隆约 372 MB，部分克隆约 1 MB，而树级操作完全不受影响。
+          filter: blob:none
           fetch-depth: 0
           persist-credentials: false
 
@@ -96,9 +105,11 @@ jobs:
           git -C source rev-parse --verify "${source_sha}^{commit}" >/dev/null
 
           release_tag="$(cd source && bash ./scripts/ci/new_release_tag.sh "${source_sha}")"
+          release_title="$(cd source && bash ./scripts/ci/release_title.sh "${source_sha}")"
 
           printf 'source_sha=%s\n' "${source_sha}" >> "${GITHUB_OUTPUT}"
           printf 'release_tag=%s\n' "${release_tag}" >> "${GITHUB_OUTPUT}"
+          printf 'release_title=%s\n' "${release_title}" >> "${GITHUB_OUTPUT}"
 
       - name: 识别受影响项目
         id: detect
@@ -211,6 +222,20 @@ jobs:
       - name: 安装 uv
         if: matrix.project.language == 'python'
         uses: astral-sh/setup-uv@v7
+        with:
+          # 缓存 key 已包含 uv.lock 哈希，各项目天然是独立条目；不加 cache-suffix，
+          # 让内容寻址的包缓存可以在项目之间共享。
+          enable-cache: true
+
+      # 该 action 会把 ACTIONS_RESULTS_URL / ACTIONS_RUNTIME_TOKEN 导出到后续步骤，
+      # 并设置 ACTIONS_CACHE_SERVICE_V2=on。SCCACHE_GHA_ENABLED 必须由我们自己给，
+      # 而它只有在上述变量存在时才能初始化后端——单独设置会让 sccache 启动失败
+      # （cache url for ghac not found）。因此本步骤必须排在 Rust 构建之前。
+      - name: 安装 sccache
+        if: matrix.project.language == 'rust'
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.19.0"
 
       - name: 构建 Rust 项目
         if: matrix.project.language == 'rust'
@@ -222,6 +247,9 @@ jobs:
           args: --locked ${{ steps.cfg.outputs.rust_args }}
           strip: true
           use-rust-cache: false
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
 
       - name: 同步 Python 项目依赖
         if: matrix.project.language == 'python'
@@ -238,6 +266,9 @@ jobs:
         if: matrix.project.language == 'python'
         uses: Nuitka/Nuitka-Action@main
         with:
+          # 默认 caching-key 是固定字符串，多个 Python 项目会共用同一个缓存前缀
+          # 而互相冲刷；按项目名区分后各自独立累积。
+          caching-key: ${{ matrix.project.name }}
           nuitka-version: ${{ steps.cfg.outputs.python_nuitka_version }}
           working-directory: source/${{ matrix.project.path }}
           script-name: ${{ steps.cfg.outputs.python_entry_file }}
@@ -278,7 +309,7 @@ jobs:
           token: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
           tag_name: ${{ needs.resolve.outputs.release_tag }}
           target_commitish: ${{ needs.resolve.outputs.source_sha }}
-          name: ${{ needs.resolve.outputs.release_tag }}
+          name: ${{ needs.resolve.outputs.release_title }}
           files: ${{ steps.package.outputs.release_asset_path }}
           fail_on_unmatched_files: true
           overwrite_files: true
