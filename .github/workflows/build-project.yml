@@ -85,6 +85,9 @@ jobs:
           # 本 job 只读提交图和目录树：变更检测用 git diff --name-only，标签与标题
           # 用 git show -s，都不读文件内容。blob:none 跳过全部历史文件内容，
           # 该仓库完整克隆约 372 MB，部分克隆约 1 MB，而树级操作完全不受影响。
+          # 注意：任何读取历史文件内容的操作都会触发 promisor 惰性拉取，而这里
+          # persist-credentials: false 没有凭据，会直接失败——scripts/ci/
+          # list_changed_files.sh 因此显式关闭了 diff 的重命名检测。
           filter: blob:none
           fetch-depth: 0
           persist-credentials: false
