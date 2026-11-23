@@ -61,6 +61,10 @@ def export_python_config(output_path: pathlib.Path, project_name: str, config: d
     if not isinstance(include_data_files, list):
         raise SystemExit("python.include_data_files 必须是数组。")
 
+    artifact_files = python_config.get("artifact_files") or []
+    if not isinstance(artifact_files, list):
+        raise SystemExit("python.artifact_files 必须是数组。")
+
     write_scalar(output_path, "asset_name", str(python_config.get("asset_name") or f"{project_name}-windows-x64.exe"))
     write_scalar(output_path, "python_entry_file", str(python_config.get("entry_file") or "main.py"))
     write_scalar(output_path, "python_mode", str(python_config.get("mode") or "onefile"))
@@ -80,6 +84,11 @@ def export_python_config(output_path: pathlib.Path, project_name: str, config: d
     write_scalar(output_path, "python_copyright", str(python_config.get("copyright") or ""))
     write_scalar(output_path, "python_trademarks", str(python_config.get("trademarks") or ""))
     write_multiline(output_path, "python_include_data_files", [str(item) for item in include_data_files])
+    write_scalar(
+        output_path,
+        "python_artifact_files_json",
+        json.dumps([str(item) for item in artifact_files], ensure_ascii=False),
+    )
 
 
 def main() -> None:

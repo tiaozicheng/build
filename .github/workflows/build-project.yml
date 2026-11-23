@@ -300,10 +300,12 @@ jobs:
             --asset-name "${{ steps.cfg.outputs.asset_name }}" \
             --runner-temp "${{ runner.temp }}" \
             --output-file "${GITHUB_OUTPUT}" \
+            --commit-sha "${{ needs.resolve.outputs.source_sha }}" \
             --rust-target "x86_64-pc-windows-msvc" \
             --rust-binary-name "${{ steps.cfg.outputs.rust_binary_name }}" \
             --rust-artifact-files-json '${{ steps.cfg.outputs.rust_artifact_files_json }}' \
-            --python-output-file "${{ steps.cfg.outputs.python_output_file }}"
+            --python-output-file "${{ steps.cfg.outputs.python_output_file }}" \
+            --python-artifact-files-json '${{ steps.cfg.outputs.python_artifact_files_json }}'
 
       - name: 上传产物到私有 Release
         uses: softprops/action-gh-release@v2
